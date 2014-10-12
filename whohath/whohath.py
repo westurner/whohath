@@ -3,8 +3,40 @@
 from __future__ import print_function
 """
 whohath -- a package lookup utility
+
+
+Distro
+  name
+  version
+  repos
+    Repo
+
+  packages
+    Package
+      distro
+      repo
+      name
+      version
+      date
+      size
+      checksum
+      signature
+      url
+
+Distro / Repository relation
+
 """
+import logging
 from collections import namedtuple, OrderedDict
+import bs4
+import requests
+import requests_cache
+
+logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger()
+
+requests_cache.install_cache('whohathcache.db', backend='sqlite',
+  expire_after=60*60*12)
 
 LICENSE_INFO = ("""
 Whohath, Copyright (C) 2014 Wes Turner.
@@ -24,8 +56,39 @@ def print_license_info(short=True, fulltext=False):
             print(f.read())
 
 
-class Package(namedtuple('Package', ('name', 'version',))):
-    pass
+class Package(namedtuple('Package',
+    ('distro',
+     'repo',
+     'name',
+     'version',
+     'desc',
+     'date',
+     'size',
+     'checksum',
+     'signature',
+     'url'))):
+    def __new__(cls,
+        distro,
+        repo,
+        name,
+        version,
+        desc=None,
+        date=None,
+        size=None,
+        checksum=None, # TODO: multiple checksums
+        signature=None,
+        url=None):
+        return super(Package, cls).__new__(cls,
+            distro,
+            repo,
+            name,
+            version,
+            desc,
+            date,
+            size,
+            checksum,
+            signature,
+            url)
 
 
 class Distro(object):
@@ -44,13 +107,120 @@ class Distro(object):
     def __str__(self):
         return u'-'.join((self.name, self.version))
 
+    __repr__ = __str__
+
     def find_package(self, pkgstr):
         raise NotImplemented
 
 
+class Repo(namedtuple('Repo', ('name', 'url',))):
+    def __new__(cls, name, url=None):
+        if url is None:
+            if name.startswith('http'):
+                url = name
+        return super(Repo, cls).__new__(cls, name, url)
+
+
+    def __unicode__(self):
+        return self.url
+
+    __str__ = __repr_ = __unicode__
+
+
 class MockLinux(Distro):
+    repos = [
+        Repo('http://example.org'),]
+
     def find_package(self, pkgstr):
-        return [ Package(pkgstr, 'todo') ] # XXX
+        for repo in self.repos:
+            yield Package(self, repo, pkgstr, 'todo')
+
+
+class Debian(Distro):
+    packages_base_url = 'http://packages.debian.org'
+    html_list_base_url = 'http://packages.debian.org/%s/allpackages'
+    names = OrderedDict((
+        ('squeeze',('squeeze', 'squeeze-updates', 'squeeze-backports',
+                    'squeeze-backports-sloppy'),),
+        ('wheezy', ('wheezy', 'wheezy-updates', 'wheezy-backports'),),
+        ('jessie', ('jessie',),),
+        ('sid',    ('sid',),),
+        ('experimental', ('experimental',),),
+    ))
+
+    repos = [] # TODO
+
+    def get_packages_from_html_list(self, name):
+        url = self.html_list_base_url % name
+        r = requests.get(url, headers={'Accept':'text/html'})
+        log.debug("Retrieving: %r" % url)
+        if r.status_code != requests.codes.OK:
+            raise Exception("Error requesting: %r: status_code: %s" %
+                           (url, r.status_code))
+        bs = bs4.BeautifulSoup(r.content)
+        for dt in bs.find_all('dt'):
+            try:
+                dd = dt.find_next('dd')
+                pkgdesc = dd.text
+                if (pkgdesc.startswith('virtual package provided by')
+                    and ') [' not in dt.text):
+                    continue
+
+                a = dt.find('a').extract()
+                pkgname = a.text
+                if ') [' in dt.text:
+                    version, reponame = dt.text[1:].split(') [', 1)
+                    version = version.lstrip('(')
+                    reponame = reponame.rstrip(']')
+                else:
+                    version = dt.text.strip(' ()')
+                    reponame = ''
+
+                _reponame = "%s--%s--%s" % (self, name, reponame)
+                _repo = Repo(name=_reponame, url=url) ## TODO: lookup from [...]
+
+                url = "%s/%s/%s" % (self.packages_base_url, name, pkgname)
+
+                yield Package(
+                    distro=self,
+                    repo=_repo, # XXX
+                    name=pkgname,
+                    version=version,
+                    desc=pkgdesc,
+                    url=url)
+            except:
+                log.error(dt)
+                log.error(dd)
+                raise
+
+    def get_all_packages_from_all_html_lists(self):
+        for distroname, pkgsets in self.names.iteritems():
+            for pkgset in pkgsets:
+                logging.debug("%s: %s" % (distroname, pkgset))
+                for pkg in self.get_packages_from_html_list(pkgset):
+                    yield pkg
+
+
+    def find_package(self, pkgstr):
+        packages = self.get_all_packages_from_all_html_lists() # TODO
+        for pkg in packages:
+            if pkgstr in pkg.name: # XXX: TODO: match_pkgname()
+                yield pkg
+
+
+class Ubuntu(Debian):
+    packages_base_url = 'http://packages.ubuntu.com'
+    html_list_base_url = 'http://packages.ubuntu.com/%s/allpackages'
+    names = OrderedDict((
+        ('lucid',   ('lucid', 'lucid-updates', 'lucid-backports'),),
+        ('precise', ('precise', 'precise-updates', 'precise-backports'),),
+        ('quantal', ('quantal', 'quantal-updates', 'quantal-backports'),),
+        ('raring',  ('raring', 'raring-updates', 'raring-backports'),),
+        ('saucy',   ('saucy', 'saucy-updates', 'saucy-backports'),),
+        ('trusty',  ('trusty',)),
+    ))
+
+    repos = []
 
 
 class DistroRegistry(OrderedDict):
@@ -61,6 +231,8 @@ class DistroRegistry(OrderedDict):
 def get_distro_registry():
     registry = DistroRegistry()
     registry.register(MockLinux(version='3000'))
+    registry.register(Debian(version='uhh')) # TODO
+    registry.register(Ubuntu(version='huh')) # TODO
     return registry
 
 
